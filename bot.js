@@ -919,14 +919,84 @@ function cleanTextForSpeech(text) {
     .slice(0, 900);
 }
 
+const OPTIMUS_RVC_SPACE = 'https://r3gm-rvc-zero.hf.space';
+const OPTIMUS_RVC_MODEL_URL =
+  'https://huggingface.co/SyntheticVoicess/OptimusPrime_Tortoise_RVC_Models/resolve/main/prime.pth';
+
+async function convertToOptimusRvc(baseMp3Buffer) {
+  try {
+    const upForm = new FormData();
+    upForm.append('files', new Blob([baseMp3Buffer], { type: 'audio/mpeg' }), 'input.mp3');
+    const upRes = await fetch(`${OPTIMUS_RVC_SPACE}/gradio_api/upload`, {
+      method: 'POST',
+      body: upForm,
+      signal: AbortSignal.timeout(12000),
+    }).then((r) => r.json());
+
+    const remotePath = Array.isArray(upRes) ? upRes[0] : null;
+    if (!remotePath) return null;
+
+    const callRes = await fetch(`${OPTIMUS_RVC_SPACE}/gradio_api/call/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(12000),
+      body: JSON.stringify({
+        data: [
+          [{ path: remotePath, meta: { _type: 'gradio.FileData' } }],
+          {
+            path: OPTIMUS_RVC_MODEL_URL,
+            url: OPTIMUS_RVC_MODEL_URL,
+            orig_name: 'prime.pth',
+            meta: { _type: 'gradio.FileData' },
+          },
+          'rmvpe+',
+          -4,
+          null,
+          0.75,
+          3,
+          0.25,
+          0.33,
+          false,
+          false,
+          'mp3',
+          1,
+        ],
+      }),
+    }).then((r) => r.json());
+
+    if (!callRes?.event_id) return null;
+
+    const sseText = await fetch(`${OPTIMUS_RVC_SPACE}/gradio_api/call/run/${callRes.event_id}`, {
+      signal: AbortSignal.timeout(25000),
+    }).then((r) => r.text());
+
+    const dataMatch = sseText.match(/event:\s*complete\s+data:\s*(\[[\s\S]+?\])\r?\n/);
+    if (!dataMatch) return null;
+    const parsed = JSON.parse(dataMatch[1]);
+    const outUrl =
+      parsed?.[0]?.[0]?.url ||
+      (parsed?.[0]?.[0]?.path ? `${OPTIMUS_RVC_SPACE}/gradio_api/file=${parsed[0][0].path}` : null);
+    if (!outUrl) return null;
+
+    const audioRes = await fetch(outUrl, { signal: AbortSignal.timeout(12000) });
+    if (!audioRes.ok) return null;
+    const rvcBuf = Buffer.from(await audioRes.arrayBuffer());
+    return rvcBuf.length > 1000 ? rvcBuf : null;
+  } catch (err) {
+    logLine(`⚠️ RVC Оптимус Прайм недоступний, використовуємо базовий голос: ${err.message}`);
+    return null;
+  }
+}
+
 async function synthesizeSpeechMp3(text) {
   const speechText = cleanTextForSpeech(text) || 'Слухаюсь, товаришу! За вашим наказом!';
+  let baseBuffer = null;
 
   if (MsEdgeTTS && OUTPUT_FORMAT) {
     try {
       const tts = new MsEdgeTTS();
-      await tts.setMetadata('uk-UA-OstapNeural', OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-      const { audioStream } = tts.toStream(speechText, { rate: '+8%', pitch: '-2Hz' });
+      await tts.setMetadata('uk-UA-OstapNeural', OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      const { audioStream } = tts.toStream(speechText, { rate: '-5%', pitch: '-6Hz' });
       const chunks = [];
       for await (const chunk of audioStream) {
         chunks.push(chunk);
@@ -936,26 +1006,31 @@ async function synthesizeSpeechMp3(text) {
       } catch (_) {}
       const buf = Buffer.concat(chunks);
       if (buf.length > 500) {
-        return buf;
+        baseBuffer = buf;
       }
     } catch (err) {
       logLine(`⚠️ Помилка MsEdgeTTS (переходимо на резервний TTS): ${err.message}`);
     }
   }
 
-  const parts = speechText.match(/.{1,180}(?:\s|$)|.{1,180}/g) || [speechText];
-  const buffers = [];
-  for (const part of parts.slice(0, 5)) {
-    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&tl=uk&client=tw-ob&q=${encodeURIComponent(part.trim())}`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (res.ok) {
-      buffers.push(Buffer.from(await res.arrayBuffer()));
+  if (!baseBuffer) {
+    const parts = speechText.match(/.{1,180}(?:\s|$)|.{1,180}/g) || [speechText];
+    const buffers = [];
+    for (const part of parts.slice(0, 5)) {
+      const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&tl=uk&client=tw-ob&q=${encodeURIComponent(part.trim())}`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (res.ok) {
+        buffers.push(Buffer.from(await res.arrayBuffer()));
+      }
     }
+    if (buffers.length === 0) {
+      throw new Error('Не вдалося синтезувати голосове повідомлення.');
+    }
+    baseBuffer = Buffer.concat(buffers);
   }
-  if (buffers.length === 0) {
-    throw new Error('Не вдалося синтезувати голосове повідомлення.');
-  }
-  return Buffer.concat(buffers);
+
+  const optimusBuffer = await convertToOptimusRvc(baseBuffer);
+  return optimusBuffer || baseBuffer;
 }
 
 async function sendVoiceMessage(chatId, text, replyToMessageId = null) {
