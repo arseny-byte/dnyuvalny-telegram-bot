@@ -34,10 +34,12 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || fileEnv.GEMINI_API_KEY || '
 const PORT = Number(process.env.PORT || fileEnv.PORT || 0);
 const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || fileEnv.PUBLIC_URL || '';
 
+const OWNER_ID = Number(process.env.OWNER_ID || fileEnv.OWNER_ID || 5067722889);
 const AGY_PATH = 'C:\\Users\\arsen\\AppData\\Local\\agy\\bin\\agy.exe';
 const BRAIN_DIR = 'C:\\Users\\arsen\\.gemini\\antigravity-cli\\brain';
 const HEARTBEAT_PATH = path.join(__dirname, 'bot-heartbeat.json');
 const RUNTIME_LOG_PATH = path.join(__dirname, 'bot-runtime.log');
+const ACCESS_PATH = path.join(__dirname, 'access-control.json');
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -45,6 +47,53 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
     fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
   } catch (_) {}
 }
+
+// Система доступу: за замовчуванням тільки власник (OWNER_ID = 5067722889)
+const accessControl = {
+  allowed: new Set([OWNER_ID]),
+  rejected: new Set(),
+  pending: new Map(), // userId -> { id, name, username, firstText, requestedAt }
+  names: new Map([[OWNER_ID, 'Арсеній (Власник)']]),
+};
+
+function loadAccessControl() {
+  try {
+    if (!fs.existsSync(ACCESS_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(ACCESS_PATH, 'utf-8'));
+    if (Array.isArray(raw.allowed)) {
+      for (const id of raw.allowed) accessControl.allowed.add(Number(id));
+    }
+    accessControl.allowed.add(OWNER_ID);
+    if (Array.isArray(raw.rejected)) {
+      for (const id of raw.rejected) accessControl.rejected.add(Number(id));
+    }
+    if (raw.pending && typeof raw.pending === 'object') {
+      for (const [k, v] of Object.entries(raw.pending)) {
+        accessControl.pending.set(Number(k), v);
+      }
+    }
+    if (raw.names && typeof raw.names === 'object') {
+      for (const [k, v] of Object.entries(raw.names)) {
+        accessControl.names.set(Number(k), v);
+      }
+    }
+  } catch (_) {}
+}
+
+function saveAccessControl() {
+  try {
+    const data = {
+      allowed: [...accessControl.allowed],
+      rejected: [...accessControl.rejected],
+      pending: Object.fromEntries(accessControl.pending),
+      names: Object.fromEntries(accessControl.names),
+    };
+    fs.writeFileSync(ACCESS_PATH, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (_) {}
+}
+
+loadAccessControl();
+saveAccessControl();
 
 // 10 хвилин неактивності до повернення на тумбочку
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
@@ -54,7 +103,7 @@ const AGY_TIMEOUT_MS = 90 * 1000;
 const chatStates = new Map();
 const botStats = {
   startedAt: new Date().toISOString(),
-  mode: GEMINI_API_KEY ? 'cloud-gemini-api' : fs.existsSync(AGY_PATH) ? 'local-smart-router' : 'cloud-waiting-key',
+  mode: fs.existsSync(AGY_PATH) ? 'local-smart-router' : GEMINI_API_KEY ? 'cloud-gemini-api' : 'cloud-waiting-key',
   messagesReceived: 0,
   questionsAnswered: 0,
   imagesSent: 0,
@@ -72,37 +121,37 @@ const MODEL_PROFILES = {
     id: 'gemini-3.8-flash-low',
     effort: 'low',
     label: '⚡ Gemini 3.8 Flash (Fast)',
-    cloudModel: 'gemini-2.5-flash',
+    cloudModel: 'gemini-3.8-flash',
   },
   flash_medium: {
     id: 'gemini-3.8-flash-medium',
     effort: 'medium',
     label: '🚀 Gemini 3.8 Flash (Medium)',
-    cloudModel: 'gemini-2.5-flash',
+    cloudModel: 'gemini-3.8-flash',
   },
   sonnet_code: {
     id: 'claude-sonnet-5-5-low',
     effort: 'low',
     label: '💻 Claude Sonnet 5.5',
-    cloudModel: 'gemini-2.5-pro',
+    cloudModel: 'gemini-4-argon',
   },
   gpt_general: {
     id: 'gpt-oss-120b-medium',
     effort: 'medium',
     label: '🤖 GPT-OSS 120B',
-    cloudModel: 'gemini-2.5-flash',
+    cloudModel: 'gemini-3.8-flash',
   },
   argon_deep: {
     id: 'gemini-4-argon-low',
     effort: 'low',
     label: '🧠 Gemini 4 Argon',
-    cloudModel: 'gemini-2.5-pro',
+    cloudModel: 'gemini-4-argon',
   },
   opus_expert: {
     id: 'claude-opus-5-5-low',
     effort: 'low',
     label: '🎖️ Claude Opus 5.5',
-    cloudModel: 'gemini-2.5-pro',
+    cloudModel: 'gemini-4-argon',
   },
 };
 
@@ -699,8 +748,8 @@ function getTokensSummary() {
   }
 }
 
-async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 'gemini-2.5-flash') {
-  const models = [preferredCloudModel, 'gemini-2.5-flash', 'gemini-2.0-flash'];
+async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 'gemini-3.8-flash') {
+  const models = [preferredCloudModel, 'gemini-3.8-flash', 'gemini-3.7-flash'];
   const userParts = [{ text: promptText }];
 
   if (fileCtx && fileCtx.buffer && fileCtx.buffer.length < 15 * 1024 * 1024 && !fileCtx.textContent) {
@@ -714,7 +763,7 @@ async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 
 
   for (const model of models) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1015,7 +1064,116 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
     });
 }
 
+function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function handleAccessCallback(cb) {
+  const fromId = cb.from?.id;
+  const data = cb.data || '';
+  if (!data.startsWith('acl_')) return;
+
+  if (fromId !== OWNER_ID) {
+    await tgApi('answerCallbackQuery', {
+      callback_query_id: cb.id,
+      text: '🚫 Тільки власник бота може керувати доступом!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const parts = data.split('_');
+  const action = parts[1]; // allow | deny
+  const targetId = Number(parts[2]);
+  if (!targetId) return;
+
+  const targetName =
+    accessControl.names.get(targetId) ||
+    accessControl.pending.get(targetId)?.name ||
+    `ID ${targetId}`;
+
+  if (action === 'allow') {
+    accessControl.allowed.add(targetId);
+    accessControl.rejected.delete(targetId);
+    accessControl.pending.delete(targetId);
+    saveAccessControl();
+
+    await tgApi('answerCallbackQuery', {
+      callback_query_id: cb.id,
+      text: `✅ Доступ відкрито для ${targetName}!`,
+    });
+
+    if (cb.message) {
+      await tgApi('editMessageText', {
+        chat_id: cb.message.chat.id,
+        message_id: cb.message.message_id,
+        parse_mode: 'HTML',
+        text: `✅ <b>ДОСТУП ДОЗВОЛЕНО</b>\n👤 Користувач: <b>${escapeHtml(targetName)}</b>\n🆔 ID: <code>${targetId}</code>`,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚫 Забрати доступ', callback_data: `acl_deny_${targetId}` }],
+          ],
+        },
+      }).catch(() => {});
+    }
+
+    await sendMessage(
+      targetId,
+      '🫡 Вітаю! Командир схвалив твою заявку на доступ до Днювального!\nТепер можеш писати мені будь-які запитання, надсилати файли, просити картинки (/img) або голосові (/voice).'
+    ).catch(() => {});
+    logLine(`✅ Власник надав доступ користувачу ${targetName} (${targetId})`);
+  } else if (action === 'deny') {
+    if (targetId === OWNER_ID) return;
+    accessControl.allowed.delete(targetId);
+    accessControl.pending.delete(targetId);
+    accessControl.rejected.add(targetId);
+    saveAccessControl();
+
+    await tgApi('answerCallbackQuery', {
+      callback_query_id: cb.id,
+      text: `❌ Доступ закрито для ${targetName}!`,
+    });
+
+    if (cb.message) {
+      await tgApi('editMessageText', {
+        chat_id: cb.message.chat.id,
+        message_id: cb.message.message_id,
+        parse_mode: 'HTML',
+        text: `❌ <b>ДОСТУП ВІДХИЛЕНО / ЗАКРИТО</b>\n👤 Користувач: <b>${escapeHtml(targetName)}</b>\n🆔 ID: <code>${targetId}</code>`,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Дозволити доступ', callback_data: `acl_allow_${targetId}` }],
+          ],
+        },
+      }).catch(() => {});
+    }
+
+    await sendMessage(targetId, '❌ Командир відхилив заявку або закрив доступ до бота.').catch(() => {});
+    logLine(`❌ Власник закрив доступ користувачу ${targetName} (${targetId})`);
+  }
+}
+
 async function processUpdateItem(item, botInfo) {
+  if (item.callback_query) {
+    await handleAccessCallback(item.callback_query);
+    return;
+  }
+
+  const anyChat =
+    item.message?.chat ||
+    item.edited_message?.chat ||
+    item.my_chat_member?.chat ||
+    item.chat_member?.chat;
+
+  if (anyChat && anyChat.type && anyChat.type !== 'private') {
+    logLine(`🚪 Автоматичний вихід із групи/каналу: ${anyChat.title || anyChat.id} (${anyChat.id})`);
+    await tgApi('leaveChat', { chat_id: anyChat.id }).catch(() => {});
+    return;
+  }
+
   const msg = item.message || item.edited_message;
   if (!msg) return;
 
@@ -1029,8 +1187,13 @@ async function processUpdateItem(item, botInfo) {
   const isPrivateChat = msg.chat?.type === 'private';
   const messageId = msg.message_id;
   const text = rawText.trim();
-  const user = msg.from?.first_name || msg.from?.username || 'Товаришу';
+  const senderId = msg.from?.id || chatId;
+  const senderUsername = msg.from?.username || '';
+  const fullName = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || senderUsername || 'Невідомий';
+  const user = msg.from?.first_name || senderUsername || 'Товаришу';
   const state = getChatState(chatId);
+
+  accessControl.names.set(senderId, `${fullName}${senderUsername ? ` (@${senderUsername})` : ''}`);
 
   botStats.messagesReceived++;
   botStats.lastMessageAt = new Date().toISOString();
@@ -1038,10 +1201,111 @@ async function processUpdateItem(item, botInfo) {
 
   const directAttachment = extractAttachmentInfo(msg);
   logLine(
-    `📩 [${user} | chat=${chatId} (${msg.chat?.type})]: ${text || ''}${
+    `📩 [${user} (${senderId}) | chat=${chatId} (${msg.chat?.type})]: ${text || ''}${
       directAttachment ? ` [📎 Файл: ${directAttachment.fileName}]` : ''
     }`
   );
+
+  // Перевірка доступу: тільки власник (OWNER_ID) та схвалені ним за заявками
+  if (senderId !== OWNER_ID && !accessControl.allowed.has(senderId)) {
+    if (accessControl.rejected.has(senderId)) {
+      await sendMessage(chatId, '🚫 Доступ до бота закритий за рішенням власника.', messageId);
+      return;
+    }
+
+    if (!accessControl.pending.has(senderId)) {
+      accessControl.pending.set(senderId, {
+        id: senderId,
+        name: fullName,
+        username: senderUsername,
+        firstText: text.slice(0, 300),
+        requestedAt: new Date().toISOString(),
+      });
+      saveAccessControl();
+
+      await tgApi('sendMessage', {
+        chat_id: OWNER_ID,
+        parse_mode: 'HTML',
+        text: [
+          '🔔 <b>Нова заявка на доступ до бота!</b>',
+          `👤 Ім'я: <b>${escapeHtml(fullName)}</b>`,
+          `🔗 Тег: ${senderUsername ? '@' + escapeHtml(senderUsername) : '<i>немає</i>'}`,
+          `🆔 ID: <code>${senderId}</code>`,
+          `💬 Написав(ла): <i>${escapeHtml(text.slice(0, 250) || '[файл/медіа]')}</i>`,
+          '',
+          'Надати цій людині доступ до Днювального?',
+        ].join('\n'),
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Дозволити', callback_data: `acl_allow_${senderId}` },
+              { text: '❌ Відхилити', callback_data: `acl_deny_${senderId}` },
+            ],
+          ],
+        },
+      }).catch((e) => logLine(`⚠️ Помилка надсилання заявки власнику: ${e.message}`));
+
+      await sendMessage(
+        chatId,
+        '🛑 Стояти! Це приватний бот. Твою заявку на доступ надіслано власнику на розгляд. Як тільки він натисне «Дозволити» — я одразу тобі напишу! 🫡',
+        messageId
+      );
+      return;
+    }
+
+    await sendMessage(
+      chatId,
+      '⏳ Твоя заявка вже на розгляді у власника. Очікуй підтвердження! 🫡',
+      messageId
+    );
+    return;
+  }
+
+  // Команда власника /users або /access для перегляду й керування доступами
+  if (senderId === OWNER_ID && /^\/(users|access)(?:@[\w_]+)?$/i.test(text)) {
+    const allowedList = [...accessControl.allowed].map(
+      (id) => `• <b>${escapeHtml(accessControl.names.get(id) || String(id))}</b> (<code>${id}</code>)`
+    );
+    const pendingList = [...accessControl.pending.values()].map(
+      (p) => `• <b>${escapeHtml(p.name)}</b> (<code>${p.id}</code>) — "${escapeHtml(p.firstText)}"`
+    );
+    const rejectedList = [...accessControl.rejected].map(
+      (id) => `• <b>${escapeHtml(accessControl.names.get(id) || String(id))}</b> (<code>${id}</code>)`
+    );
+
+    const buttons = [];
+    for (const id of accessControl.allowed) {
+      if (id === OWNER_ID) continue;
+      const label = accessControl.names.get(id) || `ID ${id}`;
+      buttons.push([{ text: `🚫 Забрати доступ: ${label.slice(0, 25)}`, callback_data: `acl_deny_${id}` }]);
+    }
+    for (const p of accessControl.pending.values()) {
+      buttons.push([
+        { text: `✅ Дозволити: ${p.name.slice(0, 18)}`, callback_data: `acl_allow_${p.id}` },
+        { text: `❌ Відхилити: ${p.name.slice(0, 18)}`, callback_data: `acl_deny_${p.id}` },
+      ]);
+    }
+    for (const id of accessControl.rejected) {
+      const label = accessControl.names.get(id) || `ID ${id}`;
+      buttons.push([{ text: `✅ Розблокувати: ${label.slice(0, 25)}`, callback_data: `acl_allow_${id}` }]);
+    }
+
+    await tgApi('sendMessage', {
+      chat_id: chatId,
+      reply_to_message_id: messageId,
+      parse_mode: 'HTML',
+      text: [
+        '🔐 <b>Керування доступом до Днювального:</b>',
+        '',
+        `✅ <b>Дозволені користувачі (${allowedList.length}):</b>`,
+        ...allowedList,
+        ...(pendingList.length ? ['\n⏳ <b>Очікують рішення:</b>', ...pendingList] : []),
+        ...(rejectedList.length ? ['\n❌ <b>Відхилені/заблоковані:</b>', ...rejectedList] : []),
+      ].join('\n'),
+      ...(buttons.length ? { reply_markup: { inline_keyboard: buttons } } : {}),
+    });
+    return;
+  }
 
   // 1. Команда /start (або /start@ArsenyASsistantbot [питання])
   const startMatch = text.match(/^\/start(?:@[\w_]+)?(?:\s+([\s\S]*))?$/i);
