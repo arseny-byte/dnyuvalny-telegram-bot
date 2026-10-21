@@ -11,6 +11,18 @@ try {
   OUTPUT_FORMAT = edgePkg.OUTPUT_FORMAT;
 } catch (_) {}
 
+let mammoth = null;
+let XLSX = null;
+let pdfParse = null;
+let AdmZip = null;
+let docxPkg = null;
+
+try { mammoth = require('mammoth'); } catch (_) {}
+try { XLSX = require('xlsx'); } catch (_) {}
+try { pdfParse = require('pdf-parse'); } catch (_) {}
+try { AdmZip = require('adm-zip'); } catch (_) {}
+try { docxPkg = require('docx'); } catch (_) {}
+
 // Завантажуємо змінні з .env (якщо файл існує)
 function loadEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -229,11 +241,13 @@ function selectSmartModel(promptText = '', fileCtx = null, forcedProfileKey = nu
 const SYSTEM_PROMPT = [
   'Ти — Днювальний (черговий днювальний на тумбочці в Telegram-чаті).',
   'ВАЖЛИВО: Відповідай одразу по суті запитання користувача в армійському стилі з гумором і повагою ("Слухаюсь!", "Так точно!", "Доповідаю:").',
-  'ЯКЩО користувач надіслав файл або просить проаналізувати/виправити/переробити файл — уважно проаналізуй його вміст і виконай наказ користувача.',
-  'ЯКЩО користувач просить скинути готовий/виправлений/створений файл у чат (код, текст, таблицю, звіт тощо) — додай у відповідь блок у форматі:',
+  'ЯКЩО користувач надіслав файл (Word .docx/.doc, PDF, Excel .xlsx/.csv, PowerPoint .pptx, ZIP-архів, код, текст, фото тощо) — уважно проаналізуй його вміст і виконай наказ користувача.',
+  'ЯКЩО користувач просить скинути, створити, відредагувати або надіслати готовий документ чи файл у чат (наприклад: вордовський документ .docx, таблицю Excel .xlsx, код, звіт, рапорт, текст тощо) — ОБОВʼЯЗКОВО додай у відповідь блок у форматі:',
   '[FILE: назва_файлу.розширення]',
-  '...вміст файлу...',
+  '...вміст файлу (для .docx пиши структурований текст із заголовками # Заголовок, списками - пункт або таблицями | колонка |; для .xlsx пиши таблицю через | або CSV)...',
   '[/FILE]',
+  'ВАЖЛИВО ДЛЯ WORD: Якщо просять "вордовський файл", "документ Word", "у ворді" або "docx" — завжди вказуй розширення .docx у тегу [FILE: документ.docx], система автоматично збереже й надішле справжній файл Microsoft Word (.docx)!',
+  'ВАЖЛИВО ДЛЯ EXCEL: Якщо просять "таблицю Excel" або "xlsx" — вказуй розширення .xlsx у тегу [FILE: таблиця.xlsx], система автоматично сформує справжній файл Excel (.xlsx)!',
   'ЯКЩО користувач просить скинути, показати, знайти або надіслати картинку, фото, фотку, мем чи зображення — дай коротку бадьору відповідь Днювального І ОБОВʼЯЗКОВО в самому кінці додай тег у форматі: [IMAGE: пошуковий запит для картинки].',
   'ЯКЩО користувач просить відповісти голосом, записати голосове повідомлення (ГС), озвучити або сказати голосом — дай чітку бадьору відповідь І ОБОВʼЯЗКОВО в самому кінці додай тег: [VOICE]',
 ].join('\n');
@@ -335,6 +349,164 @@ function isTextReadableFile(fileName, mimeType, buffer) {
   return false;
 }
 
+function stripXmlTags(xml) {
+  return String(xml || '')
+    .replace(/<w:p[^>]*>/gi, '\n')
+    .replace(/<text:p[^>]*>/gi, '\n')
+    .replace(/<a:p[^>]*>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n\n')
+    .trim();
+}
+
+function stripRtf(rtf) {
+  return String(rtf || '')
+    .replace(/\\par[d]?/gi, '\n')
+    .replace(/\\'([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\[a-z]+-?\d*\s?/gi, '')
+    .replace(/[{}]/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function extractAnyDocumentText(fileName, mimeType, buffer) {
+  const ext = path.extname(fileName || '').toLowerCase();
+
+  // 1. Word (.docx)
+  if (ext === '.docx' || /officedocument\.wordprocessingml/i.test(mimeType)) {
+    if (mammoth) {
+      try {
+        const res = await mammoth.extractRawText({ buffer });
+        if (res.value && res.value.trim()) {
+          return res.value.trim().slice(0, 60000);
+        }
+      } catch (err) {
+        logLine(`⚠️ Помилка mammoth (.docx): ${err.message}`);
+      }
+    }
+    if (AdmZip) {
+      try {
+        const zip = new AdmZip(buffer);
+        const docXml = zip.readAsText('word/document.xml');
+        if (docXml) return stripXmlTags(docXml).slice(0, 60000);
+      } catch (_) {}
+    }
+  }
+
+  // 2. Excel / таблиці (.xlsx, .xls, .ods, .csv)
+  if (/\.(xlsx|xls|ods|xlsm|xlsb)$/i.test(ext) || /spreadsheetml|ms-excel/i.test(mimeType)) {
+    if (XLSX) {
+      try {
+        const wb = XLSX.read(buffer, { type: 'buffer' });
+        const sheetsText = [];
+        for (const sheetName of wb.SheetNames) {
+          const sheet = wb.Sheets[sheetName];
+          const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          if (csv && csv.trim()) {
+            sheetsText.push(`=== Аркуш: ${sheetName} ===\n${csv.trim()}`);
+          }
+        }
+        if (sheetsText.length > 0) {
+          return sheetsText.join('\n\n').slice(0, 60000);
+        }
+      } catch (err) {
+        logLine(`⚠️ Помилка XLSX: ${err.message}`);
+      }
+    }
+  }
+
+  // 3. PDF (.pdf)
+  if (ext === '.pdf' || /application\/pdf/i.test(mimeType)) {
+    if (pdfParse) {
+      try {
+        const data = await pdfParse(buffer);
+        if (data && data.text && data.text.trim()) {
+          return data.text.trim().slice(0, 60000);
+        }
+      } catch (err) {
+        logLine(`⚠️ Помилка pdf-parse: ${err.message}`);
+      }
+    }
+  }
+
+  // 4. PowerPoint (.pptx), OpenDocument (.odt, .odp), EPUB (.epub), FB2 (.fb2)
+  if (/\.(pptx|odt|odp|epub)$/i.test(ext) && AdmZip) {
+    try {
+      const zip = new AdmZip(buffer);
+      const entries = zip.getEntries();
+      const chunks = [];
+      for (const entry of entries) {
+        if (/\.(xml|xhtml|html|htm|txt|md)$/i.test(entry.entryName) && !entry.isDirectory) {
+          if (
+            ext === '.pptx' &&
+            !/^ppt\/slides\/slide\d+\.xml$/i.test(entry.entryName) &&
+            !/^ppt\/notesSlides\//i.test(entry.entryName)
+          ) {
+            continue;
+          }
+          const raw = zip.readAsText(entry);
+          const cleaned = stripXmlTags(raw);
+          if (cleaned) {
+            chunks.push(`--- ${entry.entryName} ---\n${cleaned}`);
+          }
+        }
+      }
+      if (chunks.length > 0) {
+        return chunks.join('\n\n').slice(0, 60000);
+      }
+    } catch (_) {}
+  }
+
+  // 5. ZIP-архів (.zip) — читаємо список файлів і вміст текстових/документних файлів усередині
+  if (ext === '.zip' && AdmZip) {
+    try {
+      const zip = new AdmZip(buffer);
+      const entries = zip.getEntries();
+      const summary = [`Архів містить ${entries.length} файл(ів):`];
+      for (const entry of entries.slice(0, 30)) {
+        summary.push(`• ${entry.entryName} (${Math.round(entry.header.size / 1024)} KB)`);
+        if (!entry.isDirectory && entry.header.size < 300 * 1024) {
+          const entryBuf = entry.getData();
+          if (isTextReadableFile(entry.entryName, '', entryBuf)) {
+            summary.push(`--- Вміст ${entry.entryName} ---\n${entryBuf.toString('utf-8').slice(0, 4000)}`);
+          }
+        }
+      }
+      return summary.join('\n').slice(0, 60000);
+    } catch (_) {}
+  }
+
+  // 6. RTF (.rtf) та FB2 (.fb2)
+  if (ext === '.rtf') {
+    return stripRtf(buffer.toString('latin1')).slice(0, 60000);
+  }
+  if (ext === '.fb2') {
+    return stripXmlTags(buffer.toString('utf-8')).slice(0, 60000);
+  }
+
+  // 7. Старий Word (.doc) або бінарні файли з текстом
+  if (ext === '.doc') {
+    const utf16 = buffer.toString('utf16le').replace(/[^\x20-\x7Eа-яА-ЯіїєґІЇЄҐ0-9.,!?:;()"\-\n\r\t]/g, ' ');
+    const utf8 = buffer.toString('utf-8').replace(/[^\x20-\x7Eа-яА-ЯіїєґІЇЄҐ0-9.,!?:;()"\-\n\r\t]/g, ' ');
+    const combined = `${utf16}\n${utf8}`.replace(/\s{3,}/g, ' ').trim();
+    if (combined.length > 40) return combined.slice(0, 50000);
+  }
+
+  // 8. Звичайні текстові та кодові файли
+  if (isTextReadableFile(fileName, mimeType, buffer)) {
+    return buffer.toString('utf-8').slice(0, 60000);
+  }
+
+  return null;
+}
+
 async function downloadTelegramAttachment(attachment, chatId) {
   const fileInfoRes = await tgApi('getFile', { file_id: attachment.fileId });
   if (!fileInfoRes.ok || !fileInfoRes.result?.file_path) {
@@ -355,8 +527,8 @@ async function downloadTelegramAttachment(attachment, chatId) {
   fs.writeFileSync(localPath, buffer);
 
   let textContent = null;
-  if (attachment.type !== 'photo' && isTextReadableFile(safeName, attachment.mimeType, buffer)) {
-    textContent = buffer.toString('utf-8').slice(0, 35000);
+  if (attachment.type !== 'photo') {
+    textContent = await extractAnyDocumentText(safeName, attachment.mimeType, buffer);
   }
 
   return {
@@ -368,7 +540,213 @@ async function downloadTelegramAttachment(attachment, chatId) {
   };
 }
 
+function parseInlineRuns(lineText, TextRun, extraOpts = {}) {
+  const parts = String(lineText || '').split(/(\*\*[^*]+\*\*)/g);
+  const runs = [];
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      runs.push(
+        new TextRun({
+          text: part.slice(2, -2),
+          bold: true,
+          size: 24,
+          font: 'Calibri',
+          ...extraOpts,
+        })
+      );
+    } else {
+      runs.push(
+        new TextRun({
+          text: part,
+          size: 24,
+          font: 'Calibri',
+          ...extraOpts,
+        })
+      );
+    }
+  }
+  return runs.length > 0 ? runs : [new TextRun({ text: '', size: 24, font: 'Calibri', ...extraOpts })];
+}
+
+async function generateDocxBuffer(contentString) {
+  if (!docxPkg) {
+    return Buffer.from(contentString, 'utf-8');
+  }
+  const {
+    Document,
+    Packer,
+    Paragraph,
+    TextRun,
+    HeadingLevel,
+    Table,
+    TableRow,
+    TableCell,
+    WidthType,
+  } = docxPkg;
+
+  const lines = String(contentString || '').replace(/\r\n/g, '\n').split('\n');
+  const children = [];
+  let tableRowsBuffer = [];
+
+  const flushTable = () => {
+    if (tableRowsBuffer.length === 0) return;
+    const filtered = tableRowsBuffer.filter((row) => !row.every((cell) => /^[-:\s]+$/.test(cell)));
+    if (filtered.length > 0) {
+      const rows = filtered.map((cells, rowIdx) =>
+        new TableRow({
+          children: cells.map(
+            (cellText) =>
+              new TableCell({
+                children: [
+                  new Paragraph({
+                    children: parseInlineRuns(cellText.trim(), TextRun, rowIdx === 0 ? { bold: true } : {}),
+                  }),
+                ],
+              })
+          ),
+        })
+      );
+      children.push(
+        new Table({
+          rows,
+          width: { size: 100, type: WidthType.PERCENTAGE },
+        })
+      );
+      children.push(new Paragraph({ text: '' }));
+    }
+    tableRowsBuffer = [];
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+
+    if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length > 2) {
+      const cells = trimmed
+        .slice(1, -1)
+        .split('|')
+        .map((c) => c.trim());
+      tableRowsBuffer.push(cells);
+      continue;
+    } else {
+      flushTable();
+    }
+
+    if (!trimmed) {
+      children.push(new Paragraph({ text: '', spacing: { after: 120 } }));
+      continue;
+    }
+
+    const h1 = trimmed.match(/^#\s+(.+)$/);
+    if (h1) {
+      children.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_1,
+          children: [new TextRun({ text: h1[1].replace(/\*\*/g, ''), bold: true, size: 32, font: 'Calibri' })],
+          spacing: { before: 240, after: 120 },
+        })
+      );
+      continue;
+    }
+
+    const h2 = trimmed.match(/^##\s+(.+)$/);
+    if (h2) {
+      children.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text: h2[1].replace(/\*\*/g, ''), bold: true, size: 28, font: 'Calibri' })],
+          spacing: { before: 200, after: 100 },
+        })
+      );
+      continue;
+    }
+
+    const h3 = trimmed.match(/^###+\s+(.+)$/);
+    if (h3) {
+      children.push(
+        new Paragraph({
+          heading: HeadingLevel.HEADING_3,
+          children: [new TextRun({ text: h3[1].replace(/\*\*/g, ''), bold: true, size: 26, font: 'Calibri' })],
+          spacing: { before: 160, after: 80 },
+        })
+      );
+      continue;
+    }
+
+    const bullet = trimmed.match(/^[-*•]\s+(.+)$/);
+    if (bullet) {
+      children.push(
+        new Paragraph({
+          bullet: { level: 0 },
+          children: parseInlineRuns(bullet[1], TextRun),
+          spacing: { after: 80 },
+        })
+      );
+      continue;
+    }
+
+    children.push(
+      new Paragraph({
+        children: parseInlineRuns(rawLine, TextRun),
+        spacing: { after: 120 },
+      })
+    );
+  }
+  flushTable();
+
+  const doc = new Document({
+    sections: [{ properties: {}, children }],
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+function generateXlsxBuffer(contentString) {
+  if (!XLSX) {
+    return Buffer.from(contentString, 'utf-8');
+  }
+  const lines = String(contentString || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !/^\|?[-:\s|]+\|?$/.test(l));
+
+  const rows = lines.map((line) => {
+    if (line.includes('|')) {
+      const cleaned = line.replace(/^\|/, '').replace(/\|$/, '');
+      return cleaned.split('|').map((c) => c.trim());
+    }
+    if (line.includes(';')) {
+      return line.split(';').map((c) => c.trim());
+    }
+    return line.split(',').map((c) => c.trim());
+  });
+
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows.length ? rows : [['Порожньо']]);
+  XLSX.utils.book_append_sheet(wb, ws, 'Дані');
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
 async function sendDocumentBuffer(chatId, fileName, contentString, caption = '', replyToMessageId = null) {
+  const safeFileName = (fileName || 'document.docx').trim();
+  const ext = path.extname(safeFileName).toLowerCase();
+
+  let fileBuffer;
+  let mimeType = 'text/plain; charset=utf-8';
+
+  if (ext === '.docx' || ext === '.doc') {
+    fileBuffer = await generateDocxBuffer(contentString);
+    mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  } else if (ext === '.xlsx' || ext === '.xls') {
+    fileBuffer = generateXlsxBuffer(contentString);
+    mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  } else {
+    fileBuffer = Buffer.isBuffer(contentString) ? contentString : Buffer.from(String(contentString), 'utf-8');
+  }
+
+  const finalName = ext === '.doc' ? safeFileName.replace(/\.doc$/i, '.docx') : safeFileName;
+
   const form = new FormData();
   form.append('chat_id', String(chatId));
   if (caption) {
@@ -377,8 +755,8 @@ async function sendDocumentBuffer(chatId, fileName, contentString, caption = '',
   if (replyToMessageId) {
     form.append('reply_to_message_id', String(replyToMessageId));
   }
-  const blob = new Blob([Buffer.from(contentString, 'utf-8')], { type: 'text/plain; charset=utf-8' });
-  form.append('document', blob, fileName || 'result.txt');
+  const blob = new Blob([fileBuffer], { type: mimeType });
+  form.append('document', blob, finalName);
 
   const tgRes = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, {
     method: 'POST',
@@ -388,7 +766,7 @@ async function sendDocumentBuffer(chatId, fileName, contentString, caption = '',
   if (!tgJson.ok) {
     throw new Error(JSON.stringify(tgJson));
   }
-  logLine(`📎 Файл "${fileName}" надіслано в чат ${chatId}`);
+  logLine(`📎 Файл "${finalName}" (${Math.round(fileBuffer.length / 1024)} KB) надіслано в чат ${chatId}`);
   return true;
 }
 
@@ -1011,6 +1389,21 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
           .replace(/\[VOICE\]/gi, '')
           .trim();
 
+        const wantsWordDoc =
+          /(ворд|word|\.docx|документом|у\s+файлі\s+word|скинь\s+документ|відправ\s+документ|створи\s+документ|зроби\s+документ)/i.test(
+            questionText
+          ) || /^\/(?:doc|docx|word)\b/i.test(questionText.trim());
+        const wantsExcelDoc = /(ексель|excel|\.xlsx|таблицею\s+excel|скинь\s+таблиц)/i.test(questionText);
+
+        if (fileBlocks.length === 0 && (wantsWordDoc || wantsExcelDoc) && cleanReply.length > 20) {
+          const autoExt = wantsExcelDoc ? 'xlsx' : 'docx';
+          fileBlocks.push([
+            null,
+            `dnyuvalny_document_${Date.now()}.${autoExt}`,
+            cleanReply,
+          ]);
+        }
+
         const modelBadge = `\n\n──────────\n${modelProfile.label} • ${modelProfile.reason}`;
 
         if (fileBlocks.length > 0) {
@@ -1425,6 +1818,31 @@ async function processUpdateItem(item, botInfo) {
       return;
     }
     enqueueImage(chatId, messageId, user, query);
+    return;
+  }
+
+  // 5.1. Команда /doc, /docx, /word, /документ — гарантована генерація Word-документа (.docx)
+  const docCmdMatch = text.match(/^\/(?:doc|docx|word|документ)(?:@[\w_]+)?(?:\s+([\s\S]+))?$/i);
+  if (docCmdMatch) {
+    state.active = true;
+    resetInactivityTimer(chatId);
+    const docPrompt = (docCmdMatch[1] || '').trim();
+    if (!docPrompt && !attachment) {
+      await sendMessage(
+        chatId,
+        `🫡 Товаришу ${user}, напишіть, який саме документ Word (.docx) підготувати! Наприклад:\n• /doc Напиши рапорт на відпустку\n• /doc Зроби конспект по мережах TCP/IP\n• Або прикріпіть будь-який файл і напишіть: «перероби і скинь у ворді»`,
+        messageId
+      );
+      return;
+    }
+    enqueueQuestion(
+      chatId,
+      messageId,
+      user,
+      `${docPrompt || 'Проаналізуй прикріплений файл і оформи його вміст у гарний структурований документ.'}\n\nОБОВ'ЯЗКОВО сформуй і надішли готовий результат у блоці [FILE: document.docx] ... [/FILE]`,
+      false,
+      attachment
+    );
     return;
   }
 
