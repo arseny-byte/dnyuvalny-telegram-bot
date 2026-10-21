@@ -52,6 +52,7 @@ const BRAIN_DIR = 'C:\\Users\\arsen\\.gemini\\antigravity-cli\\brain';
 const HEARTBEAT_PATH = path.join(__dirname, 'bot-heartbeat.json');
 const RUNTIME_LOG_PATH = path.join(__dirname, 'bot-runtime.log');
 const ACCESS_PATH = path.join(__dirname, 'access-control.json');
+const VOCAB_STORE_PATH = path.join(__dirname, 'vocab-store.json');
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -59,6 +60,32 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
     fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
   } catch (_) {}
 }
+
+// Сховище інтерактивних тренажерів англійських слів (id -> { id, title, createdAt, words: [{en, transcription, uk, example}] })
+const vocabSets = new Map();
+
+function loadVocabStore() {
+  try {
+    if (!fs.existsSync(VOCAB_STORE_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(VOCAB_STORE_PATH, 'utf-8'));
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        if (v && Array.isArray(v.words) && v.words.length > 0) {
+          vocabSets.set(k, v);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+function saveVocabStore() {
+  try {
+    const entries = [...vocabSets.entries()].slice(-100);
+    fs.writeFileSync(VOCAB_STORE_PATH, JSON.stringify(Object.fromEntries(entries), null, 2), 'utf-8');
+  } catch (_) {}
+}
+
+loadVocabStore();
 
 // Система доступу: за замовчуванням тільки власник (OWNER_ID = 5067722889)
 const accessControl = {
@@ -349,6 +376,7 @@ function getChatState(chatId) {
     chatStates.set(chatId, {
       active: false,
       voiceMode: false,
+      awaitingVocabInput: false,
       forcedModel: null, // null = автоматичний розумний вибір
       timer: null,
       queue: Promise.resolve(),
@@ -1526,6 +1554,616 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
     });
 }
 
+function parseVocabTrigger(text) {
+  if (!text) return null;
+  const cleaned = text.trim();
+
+  const cmdMatch = cleaned.match(/^\/(?:words|vocab|english|eng|слова|англ)(?:@[\w_]+)?(?:\s+([\s\S]+))?$/i);
+  if (cmdMatch) {
+    return { extra: (cmdMatch[1] || '').trim() };
+  }
+
+  const naturalMatch = cleaned.match(
+    /(?:зроби|створи|згенеруй|підготуй|дай|вивчити|вивчення|тренажер|картки|тест)\s+(?:мені\s+|нам\s+)?(?:для\s+)?(?:англ(?:ійськ(?:і|их|ої))?\s+сл(?:ів|ова)|сл(?:ова|ів)\s+англ(?:ійською)?|англ\s+слов|словник|vocab|flashcards)(?:[\s:,-]+([\s\S]*))?$/i
+  );
+  if (naturalMatch) {
+    return { extra: (naturalMatch[1] || '').trim() };
+  }
+
+  if (/^(?:англ(?:ійські)?\s+слова|тренажер\s+слів|вивчити\s+слова)(?:[\s:,-]+([\s\S]*))?$/i.test(cleaned)) {
+    const m = cleaned.match(/^(?:англ(?:ійські)?\s+слова|тренажер\s+слів|вивчити\s+слова)(?:[\s:,-]+([\s\S]*))?$/i);
+    return { extra: (m?.[1] || '').trim() };
+  }
+
+  return null;
+}
+
+async function extractVocabWithAI(rawText = '', fileCtx = null) {
+  const prompt = [
+    'Ти — професійний викладач англійської мови.',
+    'Витягни або згенеруй список англійських слів/виразів із наданого матеріалу (тексту, документа чи фото) для вивчення українцям.',
+    'Якщо користувач прикріпив фото сторінки, скріншот, документ або список слів — витягни ВСІ англійські слова/фрази звідти.',
+    'Якщо користувач просто написав тему (або попросив підібрати слова) — згенеруй 12–15 корисних англійських слів за цією темою.',
+    'Для КОЖНОГО слова обовʼязково вкажи:',
+    '- "en": англійське слово або фраза (у початковій формі, з малої літери, крім власних назв)',
+    '- "transcription": фонетична транскрипція (наприклад: "[rɪˈzɪl.i.ənt]")',
+    '- "uk": точний і зрозумілий переклад українською мовою',
+    '- "example": короткий приклад речення англійською з перекладом у дужках',
+    '',
+    'ПОВЕРНИ ТІЛЬКИ ЧИСТИЙ JSON без маркдаун-обгорток у такому форматі:',
+    '{"title": "Назва набору слів українською", "words": [{"en": "word", "transcription": "[wɜːd]", "uk": "слово", "example": "This is a new word. (Це нове слово.)"}]}',
+    '',
+    rawText ? `Текст / коментар користувача:\n${rawText}` : '',
+    fileCtx && fileCtx.textContent ? `Вміст прикріпленого документа:\n${fileCtx.textContent.slice(0, 35000)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const userParts = [{ text: prompt }];
+  if (fileCtx && fileCtx.buffer && fileCtx.buffer.length < 15 * 1024 * 1024 && !fileCtx.textContent) {
+    userParts.push({
+      inlineData: {
+        mimeType: fileCtx.mimeType || 'image/jpeg',
+        data: fileCtx.buffer.toString('base64'),
+      },
+    });
+  }
+
+  let rawJsonText = '';
+  if (GEMINI_API_KEY) {
+    const models = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.7-flash'];
+    for (const model of models) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: userParts }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4000 },
+          }),
+        });
+        const data = await res.json();
+        const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
+        if (text) {
+          rawJsonText = text;
+          break;
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (!rawJsonText) {
+    const fallback = await askAntigravity(prompt, fileCtx, 'flash_fast', false);
+    rawJsonText = typeof fallback === 'string' ? fallback : fallback.answer;
+  }
+
+  const jsonMatch = String(rawJsonText || '').match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error('Не вдалося розпізнати слова. Спробуйте надіслати чіткіший список або фото.');
+  }
+
+  const parsed = JSON.parse(jsonMatch[0]);
+  const words = Array.isArray(parsed.words)
+    ? parsed.words
+        .filter((w) => w && w.en && w.uk)
+        .map((w) => ({
+          en: String(w.en).trim(),
+          transcription: String(w.transcription || '').trim() || '[—]',
+          uk: String(w.uk).trim(),
+          example: String(w.example || '').trim(),
+        }))
+    : [];
+
+  if (words.length === 0) {
+    throw new Error('Список слів порожній.');
+  }
+
+  return {
+    title: String(parsed.title || 'Тренажер англійських слів').trim(),
+    words,
+  };
+}
+
+function renderVocabHtml(vocabSet) {
+  const safeJson = JSON.stringify(vocabSet).replace(/</g, '\\u003c');
+  return `<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>${escapeHtml(vocabSet.title)} — Тренажер слів</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card-hover: #334155;
+      --accent: #38bdf8;
+      --accent-dark: #0284c7;
+      --success: #22c55e;
+      --danger: #ef4444;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { background: var(--bg); color: var(--text); min-height: 100vh; padding-bottom: 40px; }
+    header {
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      padding: 18px 16px 14px;
+      border-bottom: 1px solid #334155;
+      position: sticky; top: 0; z-index: 20;
+    }
+    .header-top { display: flex; justify-content: space-between; align-items: center; max-width: 760px; margin: 0 auto 12px; }
+    h1 { font-size: 1.2rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .badge { background: rgba(56, 189, 248, 0.15); color: var(--accent); padding: 4px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+    .tabs {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+      max-width: 760px; margin: 0 auto;
+    }
+    .tab-btn {
+      background: #1e293b; color: var(--muted); border: 1px solid #334155;
+      padding: 10px 6px; border-radius: 10px; font-size: 0.78rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; text-align: center;
+    }
+    .tab-btn.active {
+      background: var(--accent-dark); color: #fff; border-color: var(--accent);
+      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);
+    }
+    main { max-width: 760px; margin: 18px auto 0; padding: 0 14px; }
+    .word-list { display: flex; flex-direction: column; gap: 10px; }
+    .word-item {
+      background: var(--card); border: 1px solid #334155; border-radius: 14px;
+      padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    }
+    .word-main { flex: 1; }
+    .en-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+    .en-word { font-size: 1.15rem; font-weight: 700; color: var(--accent); }
+    .trans { font-size: 0.9rem; color: var(--muted); font-family: monospace; }
+    .uk-word { font-size: 1.02rem; font-weight: 600; color: #e2e8f0; margin-bottom: 4px; }
+    .example { font-size: 0.83rem; color: var(--muted); font-style: italic; }
+    .speak-btn {
+      background: #334155; border: none; color: #fff; width: 42px; height: 42px;
+      border-radius: 50%; cursor: pointer; font-size: 1.1rem; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; transition: 0.15s;
+    }
+    .speak-btn:active { transform: scale(0.92); background: var(--accent-dark); }
+
+    .trainer-card {
+      background: var(--card); border: 1px solid #334155; border-radius: 18px;
+      padding: 24px 18px; text-align: center; box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+    }
+    .progress-bar {
+      width: 100%; height: 8px; background: #0f172a; border-radius: 999px;
+      overflow: hidden; margin-bottom: 14px;
+    }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--success)); transition: width 0.3s; }
+    .stats-row { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 18px; font-weight: 600; }
+    .prompt-label { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+    .prompt-word { font-size: 1.75rem; font-weight: 800; color: #fff; margin-bottom: 6px; }
+    .prompt-sub { font-size: 1rem; color: var(--accent); font-family: monospace; margin-bottom: 20px; min-height: 22px; }
+
+    .input-wrap { display: flex; flex-direction: column; gap: 10px; max-width: 440px; margin: 0 auto; }
+    .text-input {
+      width: 100%; padding: 14px 16px; border-radius: 12px; border: 2px solid #475569;
+      background: #0f172a; color: #fff; font-size: 1.1rem; text-align: center; outline: none;
+    }
+    .text-input:focus { border-color: var(--accent); }
+    .btn-row { display: flex; gap: 8px; justify-content: center; margin-top: 6px; flex-wrap: wrap; }
+    .btn {
+      padding: 12px 20px; border-radius: 12px; border: none; font-weight: 700;
+      font-size: 0.95rem; cursor: pointer; transition: 0.15s;
+    }
+    .btn-primary { background: var(--accent-dark); color: #fff; flex: 1; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+
+    .options-grid { display: grid; grid-template-columns: 1fr; gap: 10px; max-width: 480px; margin: 0 auto; }
+    .option-btn {
+      background: #0f172a; color: #f8fafc; border: 2px solid #334155;
+      padding: 14px 16px; border-radius: 12px; font-size: 1rem; font-weight: 600;
+      cursor: pointer; transition: 0.15s; text-align: left; display: flex; align-items: center; gap: 10px;
+    }
+    .option-btn:hover:not(:disabled) { border-color: var(--accent); background: #162032; }
+    .option-btn.correct { background: rgba(34, 197, 94, 0.2); border-color: var(--success); color: #86efac; }
+    .option-btn.wrong { background: rgba(239, 68, 68, 0.2); border-color: var(--danger); color: #fca5a5; }
+    .feedback { margin-top: 16px; font-size: 1rem; font-weight: 700; min-height: 28px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-top">
+      <h1>🎓 <span id="set-title"></span></h1>
+      <span class="badge" id="word-count"></span>
+    </div>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchMode('list')">📖 Словник</button>
+      <button class="tab-btn" onclick="switchMode('write')">✍️ Напиши (UA→EN)</button>
+      <button class="tab-btn" onclick="switchMode('quiz_en_uk')">🇬🇧→🇺🇦 4 варіанти</button>
+      <button class="tab-btn" onclick="switchMode('quiz_uk_en')">🇺🇦→🇬🇧 4 варіанти</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="view-list" class="word-list"></section>
+
+    <section id="view-trainer" class="trainer-card hidden">
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width: 0%"></div></div>
+      <div class="stats-row">
+        <span id="step-counter">Слово 1 з 10</span>
+        <span id="score-counter">✅ 0 | ❌ 0</span>
+      </div>
+
+      <div class="prompt-label" id="prompt-label">Переклади англійською:</div>
+      <div class="prompt-word" id="prompt-word"></div>
+      <div class="prompt-sub" id="prompt-sub"></div>
+
+      <div id="write-box" class="input-wrap hidden">
+        <input type="text" id="answer-input" class="text-input" placeholder="Введи слово англійською..." autocomplete="off" autocapitalize="none" />
+        <div class="btn-row">
+          <button class="btn btn-secondary" onclick="giveHint()">💡 Підказка</button>
+          <button class="btn btn-primary" id="check-btn" onclick="checkWrittenAnswer()">Перевірити</button>
+        </div>
+      </div>
+
+      <div id="quiz-box" class="options-grid hidden"></div>
+
+      <div class="feedback" id="feedback"></div>
+      <div class="btn-row" style="margin-top: 14px;">
+        <button class="btn btn-secondary hidden" id="speak-current-btn" onclick="speakCurrent()">🔊 Озвучити</button>
+        <button class="btn btn-primary hidden" id="next-btn" onclick="nextQuestion()">Наступне слово ➡️</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const DATA = ${safeJson};
+    const words = DATA.words || [];
+    document.getElementById('set-title').textContent = DATA.title || 'Англійські слова';
+    document.getElementById('word-count').textContent = words.length + ' слів';
+
+    let currentMode = 'list';
+    let deck = [];
+    let currentIndex = 0;
+    let correctCount = 0;
+    let wrongCount = 0;
+    let answered = false;
+    let hintLen = 0;
+
+    function speak(text) {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.92;
+      window.speechSynthesis.speak(u);
+    }
+
+    function shuffle(arr) {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    function renderDictionary() {
+      const container = document.getElementById('view-list');
+      container.innerHTML = '';
+      words.forEach((w, idx) => {
+        const div = document.createElement('div');
+        div.className = 'word-item';
+        div.innerHTML = \`
+          <div class="word-main">
+            <div class="en-line">
+              <span class="en-word">\${idx + 1}. \${w.en}</span>
+              <span class="trans">\${w.transcription || ''}</span>
+            </div>
+            <div class="uk-word">🇺🇦 \${w.uk}</div>
+            \${w.example ? \`<div class="example">💬 \${w.example}</div>\` : ''}
+          </div>
+          <button class="speak-btn" title="Озвучити" onclick="speak(\${JSON.stringify(w.en)})">🔊</button>
+        \`;
+        container.appendChild(div);
+      });
+    }
+
+    function switchMode(mode) {
+      currentMode = mode;
+      const tabs = document.querySelectorAll('.tab-btn');
+      const modes = ['list', 'write', 'quiz_en_uk', 'quiz_uk_en'];
+      tabs.forEach((t, i) => t.classList.toggle('active', modes[i] === mode));
+
+      if (mode === 'list') {
+        document.getElementById('view-list').classList.remove('hidden');
+        document.getElementById('view-trainer').classList.add('hidden');
+        return;
+      }
+
+      document.getElementById('view-list').classList.add('hidden');
+      document.getElementById('view-trainer').classList.remove('hidden');
+
+      deck = shuffle(words);
+      currentIndex = 0;
+      correctCount = 0;
+      wrongCount = 0;
+      showQuestion();
+    }
+
+    function showQuestion() {
+      answered = false;
+      hintLen = 0;
+      document.getElementById('feedback').textContent = '';
+      document.getElementById('feedback').style.color = '#fff';
+      document.getElementById('next-btn').classList.add('hidden');
+      document.getElementById('speak-current-btn').classList.add('hidden');
+
+      if (currentIndex >= deck.length) {
+        finishRound();
+        return;
+      }
+
+      const item = deck[currentIndex];
+      const pct = Math.round((currentIndex / deck.length) * 100);
+      document.getElementById('progress-fill').style.width = pct + '%';
+      document.getElementById('step-counter').textContent = \`Слово \${currentIndex + 1} з \${deck.length}\`;
+      document.getElementById('score-counter').textContent = \`✅ \${correctCount} | ❌ \${wrongCount}\`;
+
+      const writeBox = document.getElementById('write-box');
+      const quizBox = document.getElementById('quiz-box');
+
+      if (currentMode === 'write') {
+        writeBox.classList.remove('hidden');
+        quizBox.classList.add('hidden');
+        document.getElementById('prompt-label').textContent = 'Напиши переклад англійською:';
+        document.getElementById('prompt-word').textContent = item.uk;
+        document.getElementById('prompt-sub').textContent = '';
+        const input = document.getElementById('answer-input');
+        input.value = '';
+        input.disabled = false;
+        document.getElementById('check-btn').disabled = false;
+        setTimeout(() => input.focus(), 50);
+      } else if (currentMode === 'quiz_en_uk') {
+        writeBox.classList.add('hidden');
+        quizBox.classList.remove('hidden');
+        document.getElementById('prompt-label').textContent = 'Обери правильний переклад українською:';
+        document.getElementById('prompt-word').textContent = item.en;
+        document.getElementById('prompt-sub').textContent = item.transcription || '';
+        document.getElementById('speak-current-btn').classList.remove('hidden');
+        renderQuizOptions(item, 'uk');
+      } else if (currentMode === 'quiz_uk_en') {
+        writeBox.classList.add('hidden');
+        quizBox.classList.remove('hidden');
+        document.getElementById('prompt-label').textContent = 'Обери правильний переклад англійською:';
+        document.getElementById('prompt-word').textContent = item.uk;
+        document.getElementById('prompt-sub').textContent = '';
+        renderQuizOptions(item, 'en');
+      }
+    }
+
+    function normalizeAnswer(str) {
+      return String(str || '')
+        .toLowerCase()
+        .replace(/^(to|a|an|the)\\s+/i, '')
+        .replace(/[^a-z0-9\\s'-]/g, '')
+        .replace(/\\s+/g, ' ')
+        .trim();
+    }
+
+    function giveHint() {
+      if (answered) return;
+      const item = deck[currentIndex];
+      hintLen = Math.min(item.en.length, hintLen + 2);
+      const input = document.getElementById('answer-input');
+      input.value = item.en.slice(0, hintLen);
+      document.getElementById('prompt-sub').textContent = \`Транскрипція: \${item.transcription || ''}\`;
+      input.focus();
+    }
+
+    function checkWrittenAnswer() {
+      if (answered) {
+        nextQuestion();
+        return;
+      }
+      const item = deck[currentIndex];
+      const input = document.getElementById('answer-input');
+      const userVal = input.value.trim();
+      if (!userVal) return;
+
+      answered = true;
+      input.disabled = true;
+      document.getElementById('check-btn').disabled = true;
+
+      const isOk =
+        userVal.toLowerCase() === item.en.toLowerCase() ||
+        normalizeAnswer(userVal) === normalizeAnswer(item.en);
+
+      const fb = document.getElementById('feedback');
+      if (isOk) {
+        correctCount++;
+        fb.style.color = '#4ade80';
+        fb.textContent = \`✅ Правильно! \${item.en} \${item.transcription || ''}\`;
+      } else {
+        wrongCount++;
+        fb.style.color = '#f87171';
+        fb.textContent = \`❌ Правильна відповідь: \${item.en} \${item.transcription || ''}\`;
+      }
+      speak(item.en);
+      document.getElementById('score-counter').textContent = \`✅ \${correctCount} | ❌ \${wrongCount}\`;
+      document.getElementById('speak-current-btn').classList.remove('hidden');
+      document.getElementById('next-btn').classList.remove('hidden');
+    }
+
+    document.getElementById('answer-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        if (!answered) checkWrittenAnswer();
+        else nextQuestion();
+      }
+    });
+
+    function renderQuizOptions(correctItem, field) {
+      const box = document.getElementById('quiz-box');
+      box.innerHTML = '';
+      const others = shuffle(words.filter((w) => w[field] !== correctItem[field])).slice(0, 3);
+      const options = shuffle([correctItem, ...others]);
+
+      options.forEach((opt, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'option-btn';
+        const sub = field === 'en' && opt.transcription ? \` <span style="color:#94a3b8;font-weight:400;font-size:0.88rem;">\${opt.transcription}</span>\` : '';
+        btn.innerHTML = \`<span>\${idx + 1}.</span> <span>\${opt[field]}\${sub}</span>\`;
+        btn.onclick = () => selectQuizOption(btn, opt[field] === correctItem[field], correctItem, field);
+        box.appendChild(btn);
+      });
+    }
+
+    function selectQuizOption(clickedBtn, isCorrect, correctItem, field) {
+      if (answered) return;
+      answered = true;
+
+      const allBtns = document.querySelectorAll('.option-btn');
+      allBtns.forEach((b) => {
+        b.disabled = true;
+        if (b.textContent.includes(correctItem[field])) {
+          b.classList.add('correct');
+        }
+      });
+
+      const fb = document.getElementById('feedback');
+      if (isCorrect) {
+        correctCount++;
+        clickedBtn.classList.add('correct');
+        fb.style.color = '#4ade80';
+        fb.textContent = \`✅ Точно! \${correctItem.en} \${correctItem.transcription || ''} — \${correctItem.uk}\`;
+      } else {
+        wrongCount++;
+        clickedBtn.classList.add('wrong');
+        fb.style.color = '#f87171';
+        fb.textContent = \`❌ Помилка! Правильно: \${correctItem.en} \${correctItem.transcription || ''} — \${correctItem.uk}\`;
+      }
+
+      speak(correctItem.en);
+      document.getElementById('score-counter').textContent = \`✅ \${correctCount} | ❌ \${wrongCount}\`;
+      document.getElementById('speak-current-btn').classList.remove('hidden');
+      document.getElementById('next-btn').classList.remove('hidden');
+    }
+
+    function speakCurrent() {
+      if (deck[currentIndex]) speak(deck[currentIndex].en);
+    }
+
+    function nextQuestion() {
+      currentIndex++;
+      showQuestion();
+    }
+
+    function finishRound() {
+      document.getElementById('progress-fill').style.width = '100%';
+      document.getElementById('write-box').classList.add('hidden');
+      document.getElementById('quiz-box').classList.add('hidden');
+      document.getElementById('next-btn').classList.add('hidden');
+      document.getElementById('speak-current-btn').classList.add('hidden');
+
+      const total = correctCount + wrongCount || 1;
+      const pct = Math.round((correctCount / total) * 100);
+      document.getElementById('prompt-label').textContent = 'Тренування завершено!';
+      document.getElementById('prompt-word').textContent = \`Результат: \${pct}% (\${correctCount} з \${total})\`;
+      document.getElementById('prompt-sub').textContent = pct >= 80 ? '🫡 Відмінна служба, товаришу!' : '💪 Продовжуй тренування для закріплення!';
+
+      const fb = document.getElementById('feedback');
+      fb.innerHTML = \`<button class="btn btn-primary" onclick="switchMode('\${currentMode}')">🔄 Пройти ще раз</button>\`;
+    }
+
+    renderDictionary();
+  </script>
+</body>
+</html>`;
+}
+
+function enqueueVocabTrainer(chatId, messageId, user, rawText = '', attachment = null) {
+  const state = getChatState(chatId);
+  state.pendingCount++;
+  resetInactivityTimer(chatId);
+
+  state.queue = state.queue
+    .then(async () => {
+      await tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+      try {
+        let activeFileCtx = null;
+        if (attachment) {
+          activeFileCtx = await downloadTelegramAttachment(attachment, chatId);
+          state.lastFile = activeFileCtx;
+          botStats.filesProcessed++;
+        } else if (state.lastFile && Date.now() - state.lastFile.uploadedAt < 15 * 60 * 1000 && !rawText.trim()) {
+          activeFileCtx = state.lastFile;
+        }
+
+        const vocabData = await extractVocabWithAI(rawText, activeFileCtx);
+        const id = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+        const setObj = {
+          id,
+          title: vocabData.title,
+          createdAt: new Date().toISOString(),
+          words: vocabData.words,
+        };
+        vocabSets.set(id, setObj);
+        saveVocabStore();
+
+        const baseUrl = (PUBLIC_URL || 'https://dnyuvalny-telegram-bot.onrender.com').replace(/\/$/, '');
+        const link = `${baseUrl}/vocab/${id}`;
+        const htmlContent = renderVocabHtml(setObj);
+
+        const previewLines = setObj.words
+          .slice(0, 6)
+          .map((w, i) => `${i + 1}. <b>${escapeHtml(w.en)}</b> <code>${escapeHtml(w.transcription)}</code> — ${escapeHtml(w.uk)}`);
+        if (setObj.words.length > 6) {
+          previewLines.push(`<i>...та ще ${setObj.words.length - 6} слів у тренажері!</i>`);
+        }
+
+        await tgApi('sendMessage', {
+          chat_id: chatId,
+          reply_to_message_id: messageId,
+          parse_mode: 'HTML',
+          text: [
+            `🎓 <b>Тренажер англійських слів готовий!</b>`,
+            `📚 Тема: <b>${escapeHtml(setObj.title)}</b> (${setObj.words.length} слів)`,
+            '',
+            ...previewLines,
+            '',
+            '👇 <b>Обери режим у тренажері за посиланням:</b>',
+            '• 📖 Словник + транскрипція + озвучка',
+            '• ✍️ Письмовий переклад з укр на англ',
+            '• 🇬🇧→🇺🇦 Тест (4 варіанти відповіді)',
+            '• 🇺🇦→🇬🇧 Тест (4 варіанти відповіді)',
+          ].join('\n'),
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🚀 Відкрити інтерактивний тренажер слів', url: link }],
+            ],
+          },
+        });
+
+        // Додатково надсилаємо автономний HTML-файл, щоб можна було вчити навіть без інтернету
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('caption', '📱 Також тримай офлайн HTML-файл тренажера (працює навіть без інтернету)');
+        form.append('document', new Blob([Buffer.from(htmlContent, 'utf-8')], { type: 'text/html; charset=utf-8' }), `English_Trainer_${id}.html`);
+        await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: 'POST', body: form }).catch(() => {});
+
+        logLine(`🎓 Створено тренажер слів [${id}] (${setObj.words.length} слів) для [${user}]`);
+      } catch (err) {
+        logLine(`⚠️ Помилка генерації тренажера слів: ${err.message}`);
+        await sendMessage(chatId, `⚠️ Не вдалося створити тренажер: ${err.message}`, messageId);
+      } finally {
+        state.pendingCount = Math.max(0, state.pendingCount - 1);
+      }
+    })
+    .catch((err) => {
+      state.pendingCount = Math.max(0, state.pendingCount - 1);
+      logLine(`⚠️ Помилка черги тренажера: ${err.message}`);
+    });
+}
+
 function escapeHtml(str = '') {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -1894,6 +2532,7 @@ async function processUpdateItem(item, botInfo) {
   const docCmdMatch = text.match(/^\/(?:doc|docx|word|документ)(?:@[\w_]+)?(?:\s+([\s\S]+))?$/i);
   if (docCmdMatch) {
     state.active = true;
+    state.awaitingVocabInput = false;
     resetInactivityTimer(chatId);
     const docPrompt = (docCmdMatch[1] || '').trim();
     if (!docPrompt && !attachment) {
@@ -1912,6 +2551,28 @@ async function processUpdateItem(item, botInfo) {
       false,
       attachment
     );
+    return;
+  }
+
+  // 5.15. Інтерактивний тренажер англійських слів (/words, /vocab, або "Зроби мені англ слова")
+  const vocabTrigger = parseVocabTrigger(text);
+  if (vocabTrigger || (state.awaitingVocabInput && (attachment || (text && !text.startsWith('/'))))) {
+    state.active = true;
+    resetInactivityTimer(chatId);
+
+    const extraText = vocabTrigger ? vocabTrigger.extra : text;
+    if (!extraText && !attachment) {
+      state.awaitingVocabInput = true;
+      await sendMessage(
+        chatId,
+        '🎓 Слухаюсь! Скинь мені сюди:\n• 📸 Фото або скріншот зі словами чи текстом\n• 📄 Будь-який документ (.docx, .pdf, .xlsx, .txt)\n• ✍️ Або просто напиши список слів чи тему (наприклад: «військова лексика» або «IT та програмування»)\n\nІ я одразу зроблю для тебе інтерактивне посилання-тренажер (словник + транскрипція + письмовий переклад UA→EN + тести з 4 варіантами EN↔UA)! 🫡',
+        messageId
+      );
+      return;
+    }
+
+    state.awaitingVocabInput = false;
+    enqueueVocabTrainer(chatId, messageId, user, extraText, attachment);
     return;
   }
 
@@ -2027,14 +2688,28 @@ async function processUpdateItem(item, botInfo) {
 function startHealthServer() {
   if (!PORT) return;
   const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
+    const cleanUrl = (req.url || '/').split('?')[0];
+    if (cleanUrl === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true, ...botStats }));
+      res.end(JSON.stringify({ ok: true, vocabSetsCount: vocabSets.size, ...botStats }));
+      return;
+    }
+    const vocabMatch = cleanUrl.match(/^\/vocab\/([a-zA-Z0-9_-]+)$/);
+    if (vocabMatch) {
+      const setId = vocabMatch[1];
+      const setObj = vocabSets.get(setId);
+      if (!setObj) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<h2>⚠️ Тренажер не знайдено або сервер перезавантажився. Надішліть слова боту ще раз (або відкрийте HTML-файл із чату)!</h2>');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderVocabHtml(setObj));
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(
-      `🫡 Днювальний (@ArsenyASsistantbot) на тумбочці 24/7!\nРежим: ${botStats.mode}\nПовідомлень: ${botStats.messagesReceived}\nФайлів: ${botStats.filesProcessed}\nКартинок: ${botStats.imagesSent}\nГолосових: ${botStats.voicesSent}\n`
+      `🫡 Днювальний (@ArsenyASsistantbot) на тумбочці 24/7!\nРежим: ${botStats.mode}\nПовідомлень: ${botStats.messagesReceived}\nФайлів: ${botStats.filesProcessed}\nКартинок: ${botStats.imagesSent}\nГолосових: ${botStats.voicesSent}\nТренажерів слів: ${vocabSets.size}\n`
     );
   });
 
