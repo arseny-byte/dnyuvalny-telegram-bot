@@ -160,7 +160,7 @@ const MODEL_PROFILES = {
     id: 'gemini-3.8-flash-low',
     effort: 'low',
     label: '⚡ Gemini 3.8 Flash (Fast)',
-    cloudModel: 'gemini-3.8-flash',
+    cloudModel: 'gemini-3-flash-preview',
     dailyQuota: 1500,
     rpmLimit: 15,
   },
@@ -168,7 +168,7 @@ const MODEL_PROFILES = {
     id: 'gemini-3.8-flash-medium',
     effort: 'medium',
     label: '🚀 Gemini 3.8 Flash (Medium)',
-    cloudModel: 'gemini-3.8-flash',
+    cloudModel: 'gemini-3.1-flash-lite',
     dailyQuota: 1500,
     rpmLimit: 15,
   },
@@ -176,7 +176,7 @@ const MODEL_PROFILES = {
     id: 'claude-sonnet-5-5-low',
     effort: 'low',
     label: '💻 Claude Sonnet 5.5',
-    cloudModel: 'gemini-4-argon',
+    cloudModel: 'gemini-3.6-flash',
     dailyQuota: 200,
     rpmLimit: 10,
   },
@@ -184,7 +184,7 @@ const MODEL_PROFILES = {
     id: 'gpt-oss-120b-medium',
     effort: 'medium',
     label: '🤖 GPT-OSS 120B',
-    cloudModel: 'gemini-3.8-flash',
+    cloudModel: 'gemini-3-flash-preview',
     dailyQuota: 500,
     rpmLimit: 15,
   },
@@ -192,7 +192,7 @@ const MODEL_PROFILES = {
     id: 'gemini-4-argon-low',
     effort: 'low',
     label: '🧠 Gemini 4 Argon',
-    cloudModel: 'gemini-4-argon',
+    cloudModel: 'gemini-3.6-flash',
     dailyQuota: 300,
     rpmLimit: 10,
   },
@@ -200,7 +200,7 @@ const MODEL_PROFILES = {
     id: 'claude-opus-5-5-low',
     effort: 'low',
     label: '🎖️ Claude Opus 5.5',
-    cloudModel: 'gemini-4-argon',
+    cloudModel: 'gemini-3.5-flash',
     dailyQuota: 100,
     rpmLimit: 5,
   },
@@ -1224,8 +1224,45 @@ function getTokensSummary() {
   }
 }
 
-async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 'gemini-3.8-flash') {
-  const models = [preferredCloudModel, 'gemini-3.8-flash', 'gemini-3.7-flash'];
+const cloudModelCooldowns = new Map();
+
+const CLOUD_GEMINI_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+];
+
+async function askFreeCloudFallback(promptText, systemPrompt = SYSTEM_PROMPT) {
+  try {
+    const res = await fetch('https://text.pollinations.ai/openai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: promptText },
+        ],
+        temperature: 0.7,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const txt = data?.choices?.[0]?.message?.content?.trim();
+    return txt || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 'gemini-3-flash-preview', temperature = 0.7) {
+  const candidates = [...new Set([preferredCloudModel, ...CLOUD_GEMINI_MODELS].filter(Boolean))];
   const userParts = [{ text: promptText }];
 
   if (fileCtx && fileCtx.buffer && fileCtx.buffer.length < 15 * 1024 * 1024 && !fileCtx.textContent) {
@@ -1237,24 +1274,48 @@ async function askGeminiCloud(promptText, fileCtx = null, preferredCloudModel = 
     });
   }
 
-  for (const model of models) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts: userParts }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 2500 },
-        }),
-      });
-      const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
-      if (text) return text;
-    } catch (_) {}
+  const now = Date.now();
+  const activeModels = candidates.filter((m) => (cloudModelCooldowns.get(m) || 0) <= now);
+  const modelsToTry = activeModels.length > 0 ? activeModels : candidates;
+
+  if (GEMINI_API_KEY) {
+    for (const model of modelsToTry) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents: [{ role: 'user', parts: userParts }],
+            generationConfig: { temperature, maxOutputTokens: 8192 },
+          }),
+        });
+        const data = await res.json();
+        const parts = data?.candidates?.[0]?.content?.parts || [];
+        const text = parts
+          .filter((p) => !p.thought && p.text)
+          .map((p) => p.text || '')
+          .join('')
+          .trim() || parts.map((p) => p.text || '').join('').trim();
+
+        if (text) {
+          cloudModelCooldowns.delete(model);
+          return text;
+        }
+
+        const errMsg = String(data?.error?.message || '');
+        if (/quota|rate.?limit|429/i.test(errMsg)) {
+          cloudModelCooldowns.set(model, Date.now() + 30 * 60 * 1000);
+          logLine(`⚠️ Квота хмарної моделі ${model} вичерпана, перемикаємось на резервну модель...`);
+        } else if (/no longer available|not found|404/i.test(errMsg)) {
+          cloudModelCooldowns.set(model, Date.now() + 24 * 60 * 60 * 1000);
+        }
+      } catch (_) {}
+    }
   }
-  return null;
+
+  return await askFreeCloudFallback(promptText, SYSTEM_PROMPT);
 }
 
 function runAgyWithModel(fullPrompt, modelId, effortLevel, fallbackOnError = true) {
@@ -1348,7 +1409,7 @@ async function askAntigravity(promptText, fileCtx = null, forcedProfileKey = nul
     enrichedPrompt = `${fileInfoBlock.join('\n')}\n\nНаказ / запитання користувача щодо файлу: ${promptText}`;
   }
 
-  if (GEMINI_API_KEY) {
+  if (GEMINI_API_KEY || !fs.existsSync(AGY_PATH)) {
     const cloudReply = await askGeminiCloud(enrichedPrompt, fileCtx, chosenModel.cloudModel);
     if (cloudReply) {
       return { answer: cloudReply, modelProfile: chosenModel };
@@ -1358,7 +1419,7 @@ async function askAntigravity(promptText, fileCtx = null, forcedProfileKey = nul
   if (!fs.existsSync(AGY_PATH)) {
     return {
       answer:
-        '🫡 Товаришу, для роботи в хмарі додайте змінну GEMINI_API_KEY у налаштуваннях сервера (безкоштовний ключ з aistudio.google.com)!',
+        '🫡 Товаришу, зараз усі хмарні лінії звʼязку перевантажені. Зачекайте 10–15 секунд і повторіть наказ!',
       modelProfile: chosenModel,
     };
   }
@@ -1609,29 +1670,7 @@ async function extractVocabWithAI(rawText = '', fileCtx = null) {
     });
   }
 
-  let rawJsonText = '';
-  if (GEMINI_API_KEY) {
-    const models = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.7-flash'];
-    for (const model of models) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: userParts }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 4000 },
-          }),
-        });
-        const data = await res.json();
-        const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
-        if (text) {
-          rawJsonText = text;
-          break;
-        }
-      } catch (_) {}
-    }
-  }
+  let rawJsonText = await askGeminiCloud(prompt, fileCtx, 'gemini-3-flash-preview', 0.3);
 
   if (!rawJsonText) {
     const fallback = await askAntigravity(prompt, fileCtx, 'flash_fast', false);
