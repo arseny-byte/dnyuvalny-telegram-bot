@@ -1,0 +1,17 @@
+{
+  "name": "dnyuvalny-telegram-bot",
+  "version": "2.0.0",
+  "description": "Telegram-бот Днювальний (@ArsenyASsistantbot) з підтримкою хмарного 24/7 режиму та Агента-Ревізора",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "inspector": "node inspector-agent.js",
+    "test": "node inspector-agent.js --self-test --fast"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "msedge-tts": "^2.1.0"
+  }
+}
