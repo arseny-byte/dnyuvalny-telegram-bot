@@ -134,38 +134,108 @@ const MODEL_PROFILES = {
     effort: 'low',
     label: '⚡ Gemini 3.8 Flash (Fast)',
     cloudModel: 'gemini-3.8-flash',
+    dailyQuota: 1500,
+    rpmLimit: 15,
   },
   flash_medium: {
     id: 'gemini-3.8-flash-medium',
     effort: 'medium',
     label: '🚀 Gemini 3.8 Flash (Medium)',
     cloudModel: 'gemini-3.8-flash',
+    dailyQuota: 1500,
+    rpmLimit: 15,
   },
   sonnet_code: {
     id: 'claude-sonnet-5-5-low',
     effort: 'low',
     label: '💻 Claude Sonnet 5.5',
     cloudModel: 'gemini-4-argon',
+    dailyQuota: 200,
+    rpmLimit: 10,
   },
   gpt_general: {
     id: 'gpt-oss-120b-medium',
     effort: 'medium',
     label: '🤖 GPT-OSS 120B',
     cloudModel: 'gemini-3.8-flash',
+    dailyQuota: 500,
+    rpmLimit: 15,
   },
   argon_deep: {
     id: 'gemini-4-argon-low',
     effort: 'low',
     label: '🧠 Gemini 4 Argon',
     cloudModel: 'gemini-4-argon',
+    dailyQuota: 300,
+    rpmLimit: 10,
   },
   opus_expert: {
     id: 'claude-opus-5-5-low',
     effort: 'low',
     label: '🎖️ Claude Opus 5.5',
     cloudModel: 'gemini-4-argon',
+    dailyQuota: 100,
+    rpmLimit: 5,
   },
 };
+
+const modelQuotaState = {
+  dayKey: new Date().toISOString().slice(0, 10),
+  dailyUsed: {},
+  minuteTimestamps: {},
+};
+
+function recordModelQuotaUsage(profile) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (modelQuotaState.dayKey !== today) {
+    modelQuotaState.dayKey = today;
+    modelQuotaState.dailyUsed = {};
+  }
+  const key = profile.id;
+  modelQuotaState.dailyUsed[key] = (modelQuotaState.dailyUsed[key] || 0) + 1;
+  if (!modelQuotaState.minuteTimestamps[key]) {
+    modelQuotaState.minuteTimestamps[key] = [];
+  }
+  const now = Date.now();
+  modelQuotaState.minuteTimestamps[key] = modelQuotaState.minuteTimestamps[key].filter((t) => now - t < 60000);
+  modelQuotaState.minuteTimestamps[key].push(now);
+}
+
+function getLimitsReport() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (modelQuotaState.dayKey !== today) {
+    modelQuotaState.dayKey = today;
+    modelQuotaState.dailyUsed = {};
+  }
+  const now = Date.now();
+  const lines = [
+    '📊 <b>Ліміти та залишок запитів по всіх моделях ШІ (на сьогодні):</b>',
+    '',
+  ];
+
+  for (const prof of Object.values(MODEL_PROFILES)) {
+    const usedToday = modelQuotaState.dailyUsed[prof.id] || 0;
+    const totalSession = botStats.modelUsage[prof.id] || 0;
+    const remainingDay = Math.max(0, prof.dailyQuota - usedToday);
+    const pctLeft = Math.round((remainingDay / prof.dailyQuota) * 100);
+    const recentMinute = (modelQuotaState.minuteTimestamps[prof.id] || []).filter((t) => now - t < 60000).length;
+    const rpmLeft = Math.max(0, prof.rpmLimit - recentMinute);
+
+    const barFilled = Math.max(0, Math.min(10, Math.round(pctLeft / 10)));
+    const bar = '🟩'.repeat(barFilled) + '⬜'.repeat(10 - barFilled);
+
+    lines.push(
+      `<b>${prof.label}</b>`,
+      `  ${bar} <b>${pctLeft}%</b>`,
+      `  • Залишилось сьогодні: <b>${remainingDay}</b> із ${prof.dailyQuota} (використано: ${usedToday})`,
+      `  • Хвилинний ліміт (RPM): вільно <b>${rpmLeft}/${prof.rpmLimit}</b> за хв | Всього за сесію: ${totalSession}`,
+      ''
+    );
+  }
+
+  lines.push('🔄 <i>Добові ліміти автоматично оновлюються на 100% щодня о 00:00 UTC.</i>');
+  return lines.join('\n');
+}
 
 let codeModelToggle = 0;
 
@@ -240,16 +310,16 @@ function selectSmartModel(promptText = '', fileCtx = null, forcedProfileKey = nu
 
 const SYSTEM_PROMPT = [
   'Ти — Днювальний (черговий днювальний на тумбочці в Telegram-чаті).',
-  'ВАЖЛИВО: Відповідай одразу по суті запитання користувача в армійському стилі з гумором і повагою ("Слухаюсь!", "Так точно!", "Доповідаю:").',
-  'ЯКЩО користувач надіслав файл (Word .docx/.doc, PDF, Excel .xlsx/.csv, PowerPoint .pptx, ZIP-архів, код, текст, фото тощо) — уважно проаналізуй його вміст і виконай наказ користувача.',
-  'ЯКЩО користувач просить скинути, створити, відредагувати або надіслати готовий документ чи файл у чат (наприклад: вордовський документ .docx, таблицю Excel .xlsx, код, звіт, рапорт, текст тощо) — ОБОВʼЯЗКОВО додай у відповідь блок у форматі:',
+  'ВАЖЛИВО: Відповідай КОРОТКО, ЧІТКО І ЛАКОНІЧНО (1-4 речення або стислі пункти по суті), без води та зайвих вступів, у легкому армійському стилі ("Слухаюсь!", "Так точно!", "Доповідаю:"). Пиши розгорнуто ТІЛЬКИ тоді, коли користувач сам просить написати великий текст, код або документ.',
+  'ЯКЩО користувач надіслав файл (Word .docx/.doc, PDF, Excel .xlsx/.csv, PowerPoint .pptx, ZIP-архів, код, текст, фото тощо) — уважно проаналізуй його вміст і коротко та по суті виконай наказ користувача.',
+  'ЯКЩО користувач просить скинути, створити, відредагувати або надіслати готовий документ чи файл у чат (наприклад: вордовський документ .docx, таблицю Excel .xlsx, код, звіт, рапорт, текст тощо) — дай коротку фразу-доповідь (1 речення) І ОБОВʼЯЗКОВО додай у відповідь блок у форматі:',
   '[FILE: назва_файлу.розширення]',
   '...вміст файлу (для .docx пиши структурований текст із заголовками # Заголовок, списками - пункт або таблицями | колонка |; для .xlsx пиши таблицю через | або CSV)...',
   '[/FILE]',
   'ВАЖЛИВО ДЛЯ WORD: Якщо просять "вордовський файл", "документ Word", "у ворді" або "docx" — завжди вказуй розширення .docx у тегу [FILE: документ.docx], система автоматично збереже й надішле справжній файл Microsoft Word (.docx)!',
   'ВАЖЛИВО ДЛЯ EXCEL: Якщо просять "таблицю Excel" або "xlsx" — вказуй розширення .xlsx у тегу [FILE: таблиця.xlsx], система автоматично сформує справжній файл Excel (.xlsx)!',
   'ЯКЩО користувач просить скинути, показати, знайти або надіслати картинку, фото, фотку, мем чи зображення — дай коротку бадьору відповідь Днювального І ОБОВʼЯЗКОВО в самому кінці додай тег у форматі: [IMAGE: пошуковий запит для картинки].',
-  'ЯКЩО користувач просить відповісти голосом, записати голосове повідомлення (ГС), озвучити або сказати голосом — дай чітку бадьору відповідь І ОБОВʼЯЗКОВО в самому кінці додай тег: [VOICE]',
+  'ЯКЩО користувач просить відповісти голосом, записати голосове повідомлення (ГС), озвучити або сказати голосом — дай чітку коротку відповідь І ОБОВʼЯЗКОВО в самому кінці додай тег: [VOICE]',
 ].join('\n');
 
 function logLine(message) {
@@ -1227,6 +1297,7 @@ function runAgyWithModel(fullPrompt, modelId, effortLevel, fallbackOnError = tru
 async function askAntigravity(promptText, fileCtx = null, forcedProfileKey = null, isVoice = false) {
   const chosenModel = selectSmartModel(promptText, fileCtx, forcedProfileKey, isVoice);
   botStats.modelUsage[chosenModel.id] = (botStats.modelUsage[chosenModel.id] || 0) + 1;
+  recordModelQuotaUsage(chosenModel);
   updateHeartbeat();
 
   logLine(`🧠 Автовибір моделі: ${chosenModel.label} [${chosenModel.id}] — причина: ${chosenModel.reason}`);
@@ -1404,12 +1475,10 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
           ]);
         }
 
-        const modelBadge = `\n\n──────────\n${modelProfile.label} • ${modelProfile.reason}`;
-
         if (fileBlocks.length > 0) {
           clearInterval(typingInterval);
           if (cleanReply) {
-            await sendMessage(chatId, `${cleanReply}${modelBadge}`, messageId);
+            await sendMessage(chatId, cleanReply, messageId);
           }
           for (const block of fileBlocks) {
             const outName = block[1].trim() || 'result.txt';
@@ -1424,7 +1493,7 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
           try {
             await sendPhotoByQuery(chatId, aiImageQuery, cleanReply, messageId);
           } catch (_) {
-            await sendMessage(chatId, `${cleanReply || reply}${modelBadge}`, messageId);
+            await sendMessage(chatId, cleanReply || reply, messageId);
           }
         } else if (shouldSendVoice || hasVoiceTag) {
           clearInterval(typingInterval);
@@ -1433,10 +1502,10 @@ function enqueueQuestion(chatId, messageId, user, questionText, forceVoice = fal
             await sendVoiceMessage(chatId, cleanReply || reply, messageId);
           } catch (err) {
             logLine(`⚠️ Не вдалося відправити ГС, надсилаємо текстом: ${err.message}`);
-            await sendMessage(chatId, `${cleanReply || reply}${modelBadge}`, messageId);
+            await sendMessage(chatId, cleanReply || reply, messageId);
           }
         } else {
-          await sendMessage(chatId, `${cleanReply || reply}${modelBadge}`, messageId);
+          await sendMessage(chatId, cleanReply || reply, messageId);
         }
 
         botStats.questionsAnswered++;
@@ -1712,7 +1781,7 @@ async function processUpdateItem(item, botInfo) {
     }
     await sendMessage(
       chatId,
-      `Струнко! 🫡\nТоваришу ${user}, Днювальний на тумбочці й готовий до наказів!\n\nЗвернутися до мене можна:\n1️⃣ Тегнути: @${botName} <запитання>\n2️⃣ Відповісти (Reply) на будь-яке моє повідомлення\n3️⃣ Покликати: «Днювальний», «Дневальний», «Слон» або «Слага»\n\n🧠 Розумний автовибір моделі (/model):\n• Прості питання та ГС → ⚡ Gemini 3.8 Flash\n• Код та скрипти → 💻 Claude Sonnet 5.5 / 🧠 Gemini 4 Argon\n• Складна аналітика → 🎖️ Claude Opus 5.5\n\n📎 Файли, 🎙️ Голосові (/voice, /say, /voicemode) та 🖼️ Картинки (/img <запит>) працюють!\n\nКоманди:\n• /model — переглянути або змінити модель ШІ\n• /tokens — доповідь про витрату токенів\n• /check — самоперевірка агента-ревізора`,
+      `Струнко! 🫡\nТоваришу ${user}, Днювальний на тумбочці й готовий до наказів!\n\nКоманди:\n• /limits — залишок лімітів усіх моделей ШІ\n• /doc <тема> — створити документ Word (.docx)\n• /img <запит> — знайти та скинути картинку\n• /voice <текст> — відповісти голосовим (ГС)\n• /model — переглянути або змінити модель ШІ\n• /users — керування доступом користувачів\n• /tokens — статистика токенів`,
       messageId,
       !isPrivateChat ? { reply_markup: { force_reply: true, selective: true } } : {}
     );
@@ -1843,6 +1912,19 @@ async function processUpdateItem(item, botInfo) {
       false,
       attachment
     );
+    return;
+  }
+
+  // 5.2. Команда /limits, /quota, /ліміти — показ залишку лімітів по всіх моделях
+  if (/^\/(limits|limit|quota|ліміти|ліміт)(?:@[\w_]+)?$/i.test(text)) {
+    state.active = true;
+    resetInactivityTimer(chatId);
+    await tgApi('sendMessage', {
+      chat_id: chatId,
+      reply_to_message_id: messageId,
+      parse_mode: 'HTML',
+      text: getLimitsReport(),
+    });
     return;
   }
 
